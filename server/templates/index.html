@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bitweb API Documentation</title>
+    <link rel="icon" type="image/svg+xml" href="static/logo.svg">
+    <!-- https://cdnjs.cloudflare.com/ajax/libs/font-awesome/7.0.1/css/all.min.css -->
+    <link rel="stylesheet" href="/static/css/all.min.css"
+          integrity="sha384-rWj9FmWWt3OMqd9vBkWRhFavvVUYalYqGPoMdL1brs/qvvqz88gvLShYa4hKNyqb"
+          crossorigin="anonymous">
+    <!-- https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.8/css/bootstrap.min.css -->
+    <link rel="stylesheet" href="/static/css/bootstrap.min.css"
+          integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB"
+          crossorigin="anonymous">
+    <!-- https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js -->
+    <script src="/static/js/jquery.min.js"
+            integrity="sha384-1H217gwSVyLSIfaLxHbE7dRb3v4mYCKbpQvzx0cegeju1MVsGrX5xXxAvs/HgeFs"
+            crossorigin="anonymous"></script>
+    <!-- https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js -->
+    <script src="/static/js/bootstrap.bundle.min.js"
+            integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI"
+            crossorigin="anonymous"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            padding-top: 75px;
+        }
+        .api-doc-block { margin-bottom: 1.5rem; }
+        pre { padding: 1rem; border-radius: 4px; }
+        .spinner-border { margin: 20px; }
+        .footer-link { color: #6c757d; text-decoration: none; }
+        .footer-link:hover { text-decoration: underline; }
+
+        /* pre цвет по теме */
+        [data-bs-theme="light"] pre { background: #f4f4f4; color: #212529; }
+        [data-bs-theme="dark"]  pre { background: #2a2a2a; color: #e0e0e0; }
+    </style>
+    <script>
+        (function(){
+            var t = readThemeCookie();
+            var resolved = t === 'auto' || !t
+                ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+                : t;
+            document.documentElement.setAttribute('data-bs-theme', resolved);
+
+            function readThemeCookie(){
+                var e = 'theme=', c = document.cookie.split(';');
+                for(var i=0;i<c.length;i++){
+                    var o=c[i].trim();
+                    if(o.indexOf(e)===0) return decodeURIComponent(o.substring(e.length));
+                }
+                return 'auto';
+            }
+        })();
+    </script>
+</head>
+<body>
+    <nav class="navbar fixed-top navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a href="#" class="navbar-brand"><b>Bitweb API</b></a>
+            <div class="collapse navbar-collapse">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item dropdown" id="network-list">
+                        <a class="nav-link dropdown-toggle" href="#" data-bs-toggle="dropdown">NETWORK</a>
+                        <div class="dropdown-menu"></div>
+                    </li>
+                    <li class="nav-item dropdown ms-2">
+                        <a class="nav-link dropdown-toggle" href="#" data-bs-toggle="dropdown" id="theme-label">🔄 AUTO</a>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li><a class="dropdown-item" href="#" onclick="setTheme('light');return false;">☀️ Light</a></li>
+                            <li><a class="dropdown-item" href="#" onclick="setTheme('dark');return false;">🌙 Dark</a></li>
+                            <li><hr class="dropdown-divider"></li>
+                            <li><a class="dropdown-item" href="#" onclick="setTheme('auto');return false;">🔄 Auto</a></li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container" id="docs"></div>
+
+    <footer class="mb-3 text-center">
+        <span class="fa-brands fa-github "></span> <a target="_blank" rel="noopener noreferrer" href="https://github.com/bitweb-project/api-server">Source Code</a>
+    </footer>
+
+    <script>
+        var uri = window.location.protocol + '//' + window.location.host;
+
+        var networkConfigs = {
+            'BTE': { name: 'Main Network (BTE)', api: uri }
+        };
+
+        function setCookie(n,v,d){var e='';if(d){var t=new Date;t.setTime(t.getTime()+864e5*d);e='; expires='+t.toGMTString()}document.cookie=encodeURIComponent(n)+'='+encodeURIComponent(v)+e+'; path=/'}
+        function readCookie(n){var e=encodeURIComponent(n)+'=',c=document.cookie.split(';');for(var i=0;i<c.length;i++){var o=c[i];while(o.charAt(0)===' ')o=o.substring(1,o.length);if(o.indexOf(e)===0)return decodeURIComponent(o.substring(e.length))}return null}
+
+        /* ── Theme ── */
+        function applyTheme(mode) {
+            var resolved = mode === 'auto'
+                ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+                : mode;
+            document.documentElement.setAttribute('data-bs-theme', resolved);
+            var labels = { light: '☀️ LIGHT', dark: '🌙 DARK', auto: '🔄 AUTO' };
+            $('#theme-label').text(labels[mode] || '🔄 AUTO');
+        }
+
+        function setTheme(mode) {
+            setCookie('theme', mode, 365);
+            applyTheme(mode);
+        }
+
+        // Следим за системной темой в режиме auto
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(){
+            var saved = readCookie('theme') || 'auto';
+            if(saved === 'auto') applyTheme('auto');
+        });
+
+        /* ── Network ── */
+        function displayNetworks(){
+            var net = readCookie('network') || 'BTE';
+            $('#network-list .dropdown-toggle').text(networkConfigs[net] ? networkConfigs[net].name : net);
+            var menu = $('#network-list .dropdown-menu').empty();
+            for(var k in networkConfigs){
+                menu.append('<a class="dropdown-item'+(k===net?' active':'')+'" href="#" onclick="switchConfig(`'+k+'`);return false;">'+networkConfigs[k].name+'</a>');
+            }
+        }
+        function switchConfig(net){
+            setCookie('network', net, 60);
+            displayNetworks();
+        }
+
+        var apiMethods = [
+            {
+                name: 'GET /info',
+                method: 'GET',
+                id: 'info',
+                desc: 'Current block height and coinbase maturity parameters. Returns <code>blocks</code>, <code>coinbase_maturity</code>, <code>ext_maturity_enabled</code>, <code>ext_maturity_start</code>, <code>ext_coinbase_maturity</code>.',
+                base: '/info',
+                params: []
+            },
+            {
+                name: 'GET /balance/&lt;address&gt;',
+                method: 'GET',
+                id: 'balance',
+                desc: 'Confirmed + unconfirmed balance in satoshis. Address: bech32 (web1q...) or base58check.',
+                base: '/balance/',
+                params: [{title:'address', key:true, placeholder:'web1q... or base58 address'}]
+            },
+            {
+                name: 'GET /unspent/&lt;address&gt;',
+                method: 'GET',
+                id: 'unspent',
+                desc: 'UTXO list. Each item includes <code>txid</code>, <code>index</code>, <code>value</code>, <code>height</code>, <code>script</code>, <code>coinbase</code> (bool — true if mined as block reward). Optional <code>?amount=</code> to filter by minimum value (satoshis), <code>?confirmed=true</code> to skip mempool UTXOs.',
+                base: '/unspent/',
+                params: [
+                    {title:'address', key:true,  placeholder:'web1q... or base58 address'},
+                    {title:'amount',  key:false, placeholder:'0  (min satoshis, optional)'}
+                ]
+            },
+            {
+                name: 'GET /fee',
+                method: 'GET',
+                id: 'fee',
+                desc: 'Fixed fee rate in satoshis.',
+                base: '/fee',
+                params: []
+            },
+            {
+                name: 'GET /tx/&lt;txid&gt;',
+                method: 'GET',
+                id: 'tx',
+                desc: 'Verbose transaction details. Returns <code>vin</code>, <code>vout</code> (with <code>value_sat</code>), <code>txid</code>, sizes.',
+                base: '/tx/',
+                params: [{title:'txid', key:true, placeholder:'64-char transaction id'}]
+            },
+            {
+                name: 'GET /history/&lt;address&gt;',
+                method: 'GET',
+                id: 'history',
+                desc: 'Transaction history for address. Each item: <code>{tx_hash, height}</code>. Add <code>?detailed=true</code> to annotate with <code>direction</code> ("in"/"out") and <code>received_sat</code> (last 50 txs). <code>height&nbsp;==&nbsp;0</code> = mempool.',
+                base: '/history/',
+                params: [
+                    {title:'address',  key:true,  placeholder:'web1q... or base58 address'},
+                    {title:'detailed', key:false, placeholder:'true  (optional)'}
+                ]
+            },
+            {
+                name: 'GET /rawtx/&lt;txid&gt;',
+                method: 'GET',
+                id: 'rawtx',
+                desc: 'Raw transaction hex string. Used by the web wallet to provide <code>nonWitnessUtxo</code> when signing legacy P2PKH inputs. Returns the raw hex directly as <code>result</code>.',
+                base: '/rawtx/',
+                params: [{title:'txid', key:true, placeholder:'64-char transaction id'}]
+            },
+            {
+                name: 'POST /broadcast',
+                method: 'POST',
+                id: 'broadcast',
+                desc: 'Broadcast raw transaction hex. Send as form field <code>raw=&lt;hex&gt;</code>.',
+                base: '/broadcast',
+                params: [{title:'raw', key:false, placeholder:'raw transaction hex (0100000...)'}]
+            }
+        ];
+
+        function buildParamHtml(params, method) {
+            var html = '';
+            params.forEach(function(p) {
+                html += '<div class="input-group mt-2">' +
+                    '<span class="input-group-text">' + p.title + '</span>' +
+                    '<input class="form-control docs-input" data-name="' + p.title + '" data-key="' + (p.key ? 'true' : 'false') + '" placeholder="' + (p.placeholder||'') + '">' +
+                    '</div>';
+            });
+            return html;
+        }
+
+        function renderDocs(){
+            var c = $('#docs').empty();
+            apiMethods.forEach(function(m){
+                var ph = buildParamHtml(m.params, m.method);
+                var block = $('<div class="card api-doc-block" data-base="'+uri+m.base+'" data-method="'+m.method+'">'+
+                    '<div class="card-header">'+
+                        '<span class="badge bg-'+(m.method==='POST'?'danger':'success')+'">'+m.method+'</span> '+
+                        '<b>'+m.name+'</b>'+
+                        '<button class="btn btn-primary btn-sm float-end" data-id="'+m.id+'">Run</button>'+
+                    '</div>'+
+                    '<div class="card-body">'+
+                        '<p>'+m.desc+'</p>'+
+                        '<div id="'+m.id+'">'+
+                            '<pre class="json-display d-none"></pre>'+
+                            '<div class="loading text-center d-none"><div class="spinner-border"></div></div>'+
+                            ph+
+                        '</div>'+
+                    '</div>'+
+                '</div>');
+
+                block.find('.btn[data-id]').on('click', function(){
+                    execute(m.id);
+                });
+
+                c.append(block);
+
+                if(m.params.length === 0){
+                    execute(m.id);
+                }
+            });
+        }
+
+        function execute(id){
+            var el = $('#'+id);
+            var blk = el.closest('.api-doc-block');
+            var method = blk.data('method');
+            var base   = blk.data('base');
+            var url    = base;
+            var body   = null;
+
+            el.find('.json-display').addClass('d-none').text('');
+            el.find('.loading').removeClass('d-none');
+
+            if(method === 'POST'){
+                var parts = [];
+                el.find('.docs-input').each(function(){
+                    var v = $(this).val().trim();
+                    if(v) parts.push($(this).data('name') + '=' + encodeURIComponent(v));
+                });
+                body = parts.join('&') || null;
+                if(!body){
+                    el.find('.loading').addClass('d-none');
+                    el.find('.json-display').text('Enter a value and click Run.').removeClass('d-none');
+                    return;
+                }
+            } else {
+                var queryParts = {};
+                var keyVal = '';
+                el.find('.docs-input').each(function(){
+                    var inp = $(this);
+                    var v = inp.val().trim();
+                    if(!v) return;
+                    if(inp.data('key') === 'true' || inp.data('key') === true){
+                        keyVal = v;
+                    } else {
+                        queryParts[inp.data('name')] = v;
+                    }
+                });
+
+                var hasKeyParam = el.find('.docs-input[data-key="true"]').length > 0;
+                if(hasKeyParam && !keyVal){
+                    el.find('.loading').addClass('d-none');
+                    el.find('.json-display').text('Enter an address and click Run.').removeClass('d-none');
+                    return;
+                }
+
+                url += keyVal;
+                var qs = $.param(queryParts);
+                if(qs) url += '?' + qs;
+            }
+
+            var opts = { method: method };
+            if(body){
+                opts.headers = {'Content-Type': 'application/x-www-form-urlencoded'};
+                opts.body = body;
+            }
+
+            fetch(url, opts)
+            .then(function(r){ return r.json(); })
+            .then(function(data){
+                el.find('.json-display').text(JSON.stringify(data, null, 2)).removeClass('d-none');
+                el.find('.loading').addClass('d-none');
+            })
+            .catch(function(err){
+                el.find('.json-display').text('Network error: ' + err).removeClass('d-none');
+                el.find('.loading').addClass('d-none');
+            });
+        }
+
+        $(document).ready(function(){
+            applyTheme(readCookie('theme') || 'auto');
+            displayNetworks();
+            renderDocs();
+        });
+    </script>
+</body>
+</html>
