@@ -768,10 +768,14 @@ def _ws_subscribe(data):
             else:
                 enriched = []
 
+            incoming_mempool = sum(u["value"] for u in raw_utxos if u["height"] == 0)
+            pending_out      = max(0, incoming_mempool - bal["unconfirmed"])
+
             payload = {
                 "balance":     bal["confirmed"] + bal["unconfirmed"],
                 "confirmed":   bal["confirmed"],
                 "unconfirmed": bal["unconfirmed"],
+                "pending_out": pending_out,
                 "utxos":       enriched,
                 "height":      height,
             }
@@ -837,10 +841,14 @@ def _on_scripthash_change(scripthash: str) -> None:
             else:
                 enriched = []
 
+            incoming_mempool = sum(u["value"] for u in raw_utxos if u["height"] == 0)
+            pending_out      = max(0, incoming_mempool - bal["unconfirmed"])
+
             payload = {
                 "balance":     bal["confirmed"] + bal["unconfirmed"],
                 "confirmed":   bal["confirmed"],
                 "unconfirmed": bal["unconfirmed"],
+                "pending_out": pending_out,
                 "utxos":       enriched,
                 "height":      height,
             }
