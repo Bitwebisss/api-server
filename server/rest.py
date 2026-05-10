@@ -140,6 +140,20 @@ _tx_cache: dict[str, dict] = {}
 _tx_cache_lock = threading.Lock()
 MAX_TX_CACHE_SIZE = 50_000   # ~< 100 MB depending on tx size
 
+# ---------------------------------------------------------------------------
+# History result cache  {scripthash: raw_history_list}
+#
+# blockchain.scripthash.get_history is the most-called ElectrumX method and
+# the result only changes when a new TX arrives or confirms.  We cache it per
+# scripthash and invalidate it in _on_scripthash_change().
+#
+# This eliminates the dominant source of pool exhaustion under load: without
+# the cache every /history request hammers the pool even when nothing changed.
+# ---------------------------------------------------------------------------
+_history_cache: dict[str, list] = {}
+_history_cache_lock = threading.Lock()
+MAX_HISTORY_CACHE_SIZE = 50_000  # scripthashes; each entry is a small list
+
 
 def _get_tx_verbose(txid: str) -> dict:
     """Fetch verbose TX from ElectrumX, serving from cache when available.
@@ -390,12 +404,12 @@ def get_history(address: str):
            mine_in  = Σ value of inputs  whose prevout address == our address
            mine_out = Σ value of outputs whose address         == our address
 
-           mine_in > 0, mine_out >= mine_in   → 'self' (send-to-self / consolidation
-                                                          or batched incoming+change)
-           mine_in > 0, has external outputs,
-                        mine_out < mine_in     → 'out'  (net = mine_in − mine_out)
-           mine_in == 0, mine_out > 0          → 'in'
-           otherwise                           → 'unknown'
+           mine_in > 0, mine_out >= mine_in          → 'self' (consolidation or
+                                                        batched incoming+change)
+           mine_in > 0, has external out,
+                        mine_out < mine_in            → 'out'  (net = mine_in − mine_out)
+           mine_in == 0, mine_out > 0                → 'in'
+           otherwise                                 → 'unknown'
 
     Confirmed TXs are cached in _tx_cache; repeated calls are cheap.
 
@@ -417,31 +431,43 @@ def get_history(address: str):
         return jsonify(utils.err(400, str(exc))), 400
 
     try:
-        raw_history = _pool.call("blockchain.scripthash.get_history", scripthash)
+        # Serve from cache when available; invalidated by _on_scripthash_change().
+        with _history_cache_lock:
+            _raw = _history_cache.get(scripthash)
+
+        if _raw is None:
+            _raw = _pool.call("blockchain.scripthash.get_history", scripthash)
+            with _history_cache_lock:
+                if scripthash not in _history_cache:
+                    if len(_history_cache) >= MAX_HISTORY_CACHE_SIZE:
+                        evict = MAX_HISTORY_CACHE_SIZE // 2
+                        for k in list(_history_cache.keys())[:evict]:
+                            del _history_cache[k]
+                        log.info("History cache evicted %d entries", evict)
+                    _history_cache[scripthash] = _raw
+
         history = []
         seen: set[str] = set()
-        for _h in raw_history:
+        for _h in _raw:
             _height = _h["height"]
             if _height < -1:
                 # height < -1 is not defined by the ElectrumX protocol — skip.
                 continue
             if _height == -1:
-                # height=-1: mempool TX whose inputs are also in the mempool (chain).
-                # Valid pending TX; normalise to 0 so the frontend shows a "pending"
-                # badge rather than treating it as confirmed.
+                # height=-1: mempool TX whose inputs are also unconfirmed.
+                # Normalise to 0 so the frontend shows a "pending" badge.
                 _h = dict(_h, height=0)
-            # Deduplicate by txid.  During a reorg ElectrumX can return the same
-            # txid twice — once as confirmed (height=N) and again as mempool
-            # (height=0).  Keep the first occurrence, which is the confirmed one
-            # when the list is ordered oldest-first (the normal ElectrumX order).
+            # Deduplicate by txid.  During a reorg ElectrumX can return the
+            # same txid twice: once confirmed (height=N) and again as mempool
+            # (height=0).  Keep the first occurrence (confirmed takes priority).
             if _h["tx_hash"] not in seen:
                 seen.add(_h["tx_hash"])
                 history.append(_h)
 
         # Reorg cache invalidation: if a TX we previously cached as confirmed now
-        # appears in the mempool (height=0), its cached object is stale — it still
-        # carries the old blockhash/blocktime.  Evict it so _get_tx_verbose fetches
-        # a fresh copy from the node.
+        # appears at height=0 (reorg put it back in the mempool), its cached
+        # verbose object is stale — it still carries the old blockhash/blocktime.
+        # Evict it so _get_tx_verbose fetches a fresh copy from the node.
         with _tx_cache_lock:
             for _h in history:
                 if _h["height"] == 0 and _h["tx_hash"] in _tx_cache:
@@ -536,14 +562,14 @@ def get_history(address: str):
                 net = mine_in - mine_out
                 if not has_external_out or mine_out >= mine_in:
                     # All outputs return to us, or we received at least as much
-                    # as we spent (e.g. batched TX where we are also a recipient).
-                    # Both cases are "self" per the Electrum wallet convention.
+                    # as we spent (batched TX where we are also a recipient).
+                    # Both cases match Electrum wallet's "self" convention.
                     direction = "self"
                     amount    = mine_out
                 else:
                     direction = "out"
-                    # net < 0 is theoretically impossible in a valid TX but
-                    # guard anyway to prevent a negative amount in the response.
+                    # net < 0 is impossible in a valid TX but guard to prevent
+                    # a negative amount reaching the response.
                     amount    = max(net, 0)
             elif mine_out > 0:
                 direction = "in"
@@ -772,6 +798,11 @@ def _on_new_block(height: int) -> None:
 def _on_scripthash_change(scripthash: str) -> None:
     """Called when ElectrumX reports a status change on a watched scripthash."""
     log.debug("Balance changed: scripthash=%s…", scripthash[:12])
+
+    # Invalidate the history cache for this scripthash so the next /history
+    # request fetches fresh data from ElectrumX instead of the stale list.
+    with _history_cache_lock:
+        _history_cache.pop(scripthash, None)
 
     def _fetch_and_push():
         # O(1) check — skip fetch if no clients are watching this scripthash
