@@ -22,9 +22,10 @@ CLIENT_VERSION = "1.0"
 PROTOCOL_MIN   = "1.4"
 PROTOCOL_MAX   = "1.4"
 
-# ElectrumX closes idle connections after ~10 minutes.
-# Ping every 5 minutes to keep the session alive.
-PING_INTERVAL = 300  # seconds
+# ElectrumX closes idle connections after ~10 minutes at the protocol level,
+# but in practice the observed server-side idle timeout is ~240 s.
+# Ping every 3 minutes (180 s) to stay well within that limit.
+PING_INTERVAL = 180  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +118,30 @@ class ElectrumPool:
     """Round-robin pool of ElectrumClient connections."""
 
     def __init__(self, host, port, timeout, verify_ssl, size=8):
+        self._clients: list = []
         self._queue = queue.Queue()
         for _ in range(size):
-            self._queue.put(ElectrumClient(host, port, timeout, verify_ssl))
+            c = ElectrumClient(host, port, timeout, verify_ssl)
+            self._clients.append(c)
+            self._queue.put(c)
+        # Keep pool connections alive so the server does not close idle sockets.
+        # Each client is borrowed one-at-a-time: if a client is checked out by
+        # an active request it is not idle and does not need a ping.
+        t = threading.Thread(
+            target=self._keepalive, daemon=True, name="electrum-pool-keepalive"
+        )
+        t.start()
+
+    def _keepalive(self) -> None:
+        while True:
+            time.sleep(PING_INTERVAL)
+            for client in list(self._clients):
+                try:
+                    client.call("server.ping")
+                except Exception as exc:
+                    log.debug(
+                        "Pool keepalive ping failed (%s) — will reconnect on next use", exc
+                    )
 
     def call(self, method, *params):
         client = self._queue.get()

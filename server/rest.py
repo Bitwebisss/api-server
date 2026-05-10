@@ -390,10 +390,12 @@ def get_history(address: str):
            mine_in  = Σ value of inputs  whose prevout address == our address
            mine_out = Σ value of outputs whose address         == our address
 
-           mine_in > 0, mine_out < mine_in  → 'out'  (net = mine_in − mine_out)
-           mine_in > 0, mine_out >= mine_in → 'self' (send-to-self / consolidation)
-           mine_in == 0, mine_out > 0       → 'in'
-           otherwise                        → 'unknown'
+           mine_in > 0, mine_out >= mine_in   → 'self' (send-to-self / consolidation
+                                                          or batched incoming+change)
+           mine_in > 0, has external outputs,
+                        mine_out < mine_in     → 'out'  (net = mine_in − mine_out)
+           mine_in == 0, mine_out > 0          → 'in'
+           otherwise                           → 'unknown'
 
     Confirmed TXs are cached in _tx_cache; repeated calls are cheap.
 
@@ -417,18 +419,35 @@ def get_history(address: str):
     try:
         raw_history = _pool.call("blockchain.scripthash.get_history", scripthash)
         history = []
+        seen: set[str] = set()
         for _h in raw_history:
             _height = _h["height"]
             if _height < -1:
-                # height < -1 не предусмотрен протоколом ElectrumX — пропускаем
+                # height < -1 is not defined by the ElectrumX protocol — skip.
                 continue
             if _height == -1:
-                # height=-1: мемпул-TX, чьи входы тоже в мемпуле (цепочка).
-                # Это валидная pending-транзакция; нормализуем до 0, чтобы
-                # фронтенд показал её с бейджем «ожидание», а не считал
-                # подтверждённой.
+                # height=-1: mempool TX whose inputs are also in the mempool (chain).
+                # Valid pending TX; normalise to 0 so the frontend shows a "pending"
+                # badge rather than treating it as confirmed.
                 _h = dict(_h, height=0)
-            history.append(_h)
+            # Deduplicate by txid.  During a reorg ElectrumX can return the same
+            # txid twice — once as confirmed (height=N) and again as mempool
+            # (height=0).  Keep the first occurrence, which is the confirmed one
+            # when the list is ordered oldest-first (the normal ElectrumX order).
+            if _h["tx_hash"] not in seen:
+                seen.add(_h["tx_hash"])
+                history.append(_h)
+
+        # Reorg cache invalidation: if a TX we previously cached as confirmed now
+        # appears in the mempool (height=0), its cached object is stale — it still
+        # carries the old blockhash/blocktime.  Evict it so _get_tx_verbose fetches
+        # a fresh copy from the node.
+        with _tx_cache_lock:
+            for _h in history:
+                if _h["height"] == 0 and _h["tx_hash"] in _tx_cache:
+                    log.debug("Evicting stale tx cache after reorg: %s", _h["tx_hash"][:16])
+                    del _tx_cache[_h["tx_hash"]]
+
     except Exception as exc:
         log.exception("GET /history/%s — history fetch", address)
         return jsonify(utils.err(500, str(exc))), 500
@@ -514,13 +533,18 @@ def get_history(address: str):
                     has_external_out = True
 
             if mine_in > 0:
-                if not has_external_out:
-                    # All outputs return to us — self-send / consolidation
+                net = mine_in - mine_out
+                if not has_external_out or mine_out >= mine_in:
+                    # All outputs return to us, or we received at least as much
+                    # as we spent (e.g. batched TX where we are also a recipient).
+                    # Both cases are "self" per the Electrum wallet convention.
                     direction = "self"
                     amount    = mine_out
                 else:
                     direction = "out"
-                    amount    = mine_in - mine_out   # net (fee included)
+                    # net < 0 is theoretically impossible in a valid TX but
+                    # guard anyway to prevent a negative amount in the response.
+                    amount    = max(net, 0)
             elif mine_out > 0:
                 direction = "in"
                 amount    = mine_out
