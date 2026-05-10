@@ -142,20 +142,31 @@ MAX_TX_CACHE_SIZE = 50_000   # ~< 100 MB depending on tx size
 
 
 def _get_tx_verbose(txid: str) -> dict:
-    """Fetch verbose TX from ElectrumX, serving from cache when available."""
+    """Fetch verbose TX from ElectrumX, serving from cache when available.
+
+    Only confirmed transactions (those with a blockhash/blocktime) are cached.
+    Unconfirmed (mempool) transactions are never stored: they can gain a
+    blocktime once mined, and caching them would cause stale timestamp=None
+    forever even after confirmation.
+    """
     with _tx_cache_lock:
         if txid in _tx_cache:
             return _tx_cache[txid]
 
     raw = _pool.call("blockchain.transaction.get", txid, True)
 
-    with _tx_cache_lock:
-        if txid not in _tx_cache:
-            if len(_tx_cache) >= MAX_TX_CACHE_SIZE:
-                for key in list(_tx_cache.keys())[:MAX_TX_CACHE_SIZE // 2]:
-                    del _tx_cache[key]
-                log.info("TX cache evicted %d entries", MAX_TX_CACHE_SIZE // 2)
-            _tx_cache[txid] = raw
+    # Кешируем только подтверждённые TX — у них есть blockhash или blocktime.
+    # Мемпуловые TX не кешируем: после майнинга они обретают blocktime,
+    # и устаревший кеш вернул бы timestamp=None навсегда.
+    is_confirmed = bool(raw.get("blockhash") or raw.get("blocktime") or raw.get("confirmations", 0) > 0)
+    if is_confirmed:
+        with _tx_cache_lock:
+            if txid not in _tx_cache:
+                if len(_tx_cache) >= MAX_TX_CACHE_SIZE:
+                    for key in list(_tx_cache.keys())[:MAX_TX_CACHE_SIZE // 2]:
+                        del _tx_cache[key]
+                    log.info("TX cache evicted %d entries", MAX_TX_CACHE_SIZE // 2)
+                _tx_cache[txid] = raw
     return raw
 
 
@@ -404,8 +415,20 @@ def get_history(address: str):
         return jsonify(utils.err(400, str(exc))), 400
 
     try:
-        history = _pool.call("blockchain.scripthash.get_history", scripthash)
-        history = [h for h in history if h["height"] >= 0]   # drop orphans
+        raw_history = _pool.call("blockchain.scripthash.get_history", scripthash)
+        history = []
+        for _h in raw_history:
+            _height = _h["height"]
+            if _height < -1:
+                # height < -1 не предусмотрен протоколом ElectrumX — пропускаем
+                continue
+            if _height == -1:
+                # height=-1: мемпул-TX, чьи входы тоже в мемпуле (цепочка).
+                # Это валидная pending-транзакция; нормализуем до 0, чтобы
+                # фронтенд показал её с бейджем «ожидание», а не считал
+                # подтверждённой.
+                _h = dict(_h, height=0)
+            history.append(_h)
     except Exception as exc:
         log.exception("GET /history/%s — history fetch", address)
         return jsonify(utils.err(500, str(exc))), 500
