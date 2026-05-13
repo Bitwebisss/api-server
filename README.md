@@ -34,7 +34,7 @@ User=explorer
 Group=explorer
 WorkingDirectory=/home/explorer/api-server-master
 Environment="PATH=/home/explorer/api-server-master/venv/bin"
-ExecStart=/home/explorer/api-server-master/venv/bin/gunicorn --bind 127.0.0.1:21223 --workers 4 --timeout 30 app:app
+ExecStart=/home/explorer/api-server-master/venv/bin/gunicorn --bind 127.0.0.1:21223 --worker-class eventlet -w 1 --timeout 0 app:app
 Restart=always
 
 [Install]

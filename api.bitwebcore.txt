@@ -1,0 +1,129 @@
+limit_req_zone $binary_remote_addr zone=bitweb_api:10m rate=300r/m;
+limit_req_zone $binary_remote_addr zone=bitweb_broadcast:10m rate=20r/m;
+limit_req_zone $binary_remote_addr zone=bitweb_ws:10m rate=10r/m;
+
+server {
+    server_name api.bitwebcore.net;
+    listen 443 ssl;
+
+    ssl_certificate     /etc/letsencrypt/live/api.bitwebcore.net/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.bitwebcore.net/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    server_tokens off;
+
+    if ($blocked_agent) { return 444; }
+    if ($blocked_args)  { return 444; }
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Strict CSP - only self, no inline, no eval, no external CDN
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self' data:; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';" always;
+
+    location = / {
+        proxy_pass         http://127.0.0.1:21223;
+        proxy_set_header   X-Forwarded-For $remote_addr;
+        proxy_set_header   Host $http_host;
+        proxy_read_timeout 10s;
+    }
+
+    location /static/ {
+        proxy_pass         http://127.0.0.1:21223;
+        proxy_set_header   X-Forwarded-For $remote_addr;
+        proxy_set_header   Host $http_host;
+        proxy_read_timeout 10s;
+        expires 1d;
+        access_log off;
+    }
+
+    location = /info {
+        limit_req zone=bitweb_api burst=200 nodelay;
+        proxy_pass         http://127.0.0.1:21223;
+        proxy_set_header   X-Forwarded-For $remote_addr;
+        proxy_set_header   Host $http_host;
+        proxy_read_timeout 20s;
+    }
+
+    location = /fee {
+        limit_req zone=bitweb_api burst=200 nodelay;
+        proxy_pass         http://127.0.0.1:21223;
+        proxy_set_header   X-Forwarded-For $remote_addr;
+        proxy_set_header   Host $http_host;
+        proxy_read_timeout 10s;
+    }
+
+    location ~ "^/balance/[a-zA-Z0-9]{25,90}$" {
+        limit_req zone=bitweb_api burst=200 nodelay;
+        proxy_pass         http://127.0.0.1:21223;
+        proxy_set_header   X-Forwarded-For $remote_addr;
+        proxy_set_header   Host $http_host;
+        proxy_read_timeout 20s;
+    }
+
+    location ~ "^/unspent/[a-zA-Z0-9]{25,90}$" {
+        limit_req zone=bitweb_api burst=200 nodelay;
+        proxy_pass         http://127.0.0.1:21223;
+        proxy_set_header   X-Forwarded-For $remote_addr;
+        proxy_set_header   Host $http_host;
+        proxy_read_timeout 20s;
+    }
+
+    location ~ "^/history/[a-zA-Z0-9]{25,90}$" {
+        limit_req zone=bitweb_api burst=200 nodelay;
+        proxy_pass         http://127.0.0.1:21223;
+        proxy_set_header   X-Forwarded-For $remote_addr;
+        proxy_set_header   Host $http_host;
+        proxy_read_timeout 20s;
+    }
+
+    location ~ "^/tx/[0-9a-fA-F]{64}$" {
+        limit_req zone=bitweb_api burst=200 nodelay;
+        proxy_pass         http://127.0.0.1:21223;
+        proxy_set_header   X-Forwarded-For $remote_addr;
+        proxy_set_header   Host $http_host;
+        proxy_read_timeout 20s;
+    }
+
+    location ~ "^/rawtx/[0-9a-fA-F]{64}$" {
+        limit_req zone=bitweb_api burst=200 nodelay;
+        proxy_pass         http://127.0.0.1:21223;
+        proxy_set_header   X-Forwarded-For $remote_addr;
+        proxy_set_header   Host $http_host;
+        proxy_read_timeout 20s;
+    }
+
+    location = /broadcast {
+        limit_req zone=bitweb_broadcast burst=10 nodelay;
+        client_max_body_size 100k;
+        proxy_pass           http://127.0.0.1:21223;
+        proxy_set_header     X-Forwarded-For $remote_addr;
+        proxy_set_header     Host $http_host;
+        proxy_read_timeout   30s;
+    }
+
+    location /socket.io/ {
+        limit_req zone=bitweb_ws burst=20 nodelay;
+        proxy_pass             http://127.0.0.1:21223;
+        proxy_http_version     1.1;
+        proxy_set_header       Upgrade    $http_upgrade;
+        proxy_set_header       Connection "upgrade";
+        proxy_set_header       X-Forwarded-For $remote_addr;
+        proxy_set_header       Host $http_host;
+        proxy_read_timeout     3600s;
+    }
+
+    location / {
+        return 444;
+    }
+}
+
+server {
+    listen 80;
+    server_name api.bitwebcore.net;
+    return 301 https://$host$request_uri;
+}

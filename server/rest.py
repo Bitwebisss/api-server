@@ -240,13 +240,7 @@ _tip_lock = threading.Lock()
 def get_info():
     try:
         height = _get_tip_height()
-        return jsonify(utils.ok({
-            "blocks":                height,
-            "coinbase_maturity":     config.COINBASE_MATURITY,
-            "ext_maturity_enabled":  config.EXT_MATURITY_ENABLED,
-            "ext_maturity_start":    config.EXT_MATURITY_START,
-            "ext_coinbase_maturity": config.EXT_COINBASE_MATURITY,
-        }))
+        return jsonify(utils.ok({"blocks": height}))
     except Exception as exc:
         log.exception("GET /info")
         return jsonify(utils.err(500, str(exc))), 500
