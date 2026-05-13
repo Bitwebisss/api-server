@@ -704,6 +704,10 @@ def init(app):
 # per-sid mapping: sid -> currently subscribed scripthash
 _sid_rooms: dict = {}
 
+# per-sid rate limiting for subscribe events: sid -> monotonic timestamp of last subscribe
+_sid_last_sub: dict = {}
+_SUB_MIN_INTERVAL = 1.0   # seconds between subscribe calls per connection
+
 # scripthash -> script hex (used when pushing UTXOs to clients)
 _scripthash_scripts: dict = {}
 
@@ -721,6 +725,7 @@ def _ws_connect():
 @socketio.on("disconnect")
 def _ws_disconnect():
     with _sid_lock:
+        _sid_last_sub.pop(request.sid, None)
         old_sh = _sid_rooms.pop(request.sid, None)
         if old_sh:
             count = _scripthash_refcount.get(old_sh, 1) - 1
@@ -736,6 +741,13 @@ def _ws_disconnect():
 def _ws_subscribe(data):
     if not isinstance(data, dict):
         return
+
+    now = time.monotonic()
+    with _sid_lock:
+        if now - _sid_last_sub.get(request.sid, 0) < _SUB_MIN_INTERVAL:
+            socketio.emit("error", {"message": "rate limited"}, to=request.sid)
+            return
+        _sid_last_sub[request.sid] = now
 
     address = str(data.get("address", "")).strip()
     try:
