@@ -184,6 +184,60 @@ def _get_tx_verbose(txid: str) -> dict:
     return raw
 
 
+def _get_tx_verbose_batch(txids: list) -> dict:
+    """
+    Fetch multiple verbose TXs in one pipelined batch, serving cache hits first.
+
+    Returns {txid: raw_dict | None}.  None means the fetch failed or ElectrumX
+    reported an error (unknown txid).  Confirmed TXs are written back to
+    _tx_cache exactly as _get_tx_verbose does.
+    """
+    result  = {}
+    needed  = []
+
+    with _tx_cache_lock:
+        for txid in txids:
+            if txid in _tx_cache:
+                result[txid] = _tx_cache[txid]
+            else:
+                needed.append(txid)
+
+    if not needed:
+        return result
+
+    requests = [("blockchain.transaction.get", [txid, True]) for txid in needed]
+    try:
+        responses = _pool.call_batch(requests)
+    except Exception as exc:
+        log.warning("Batch TX fetch failed: %s", exc)
+        for txid in needed:
+            result[txid] = None
+        return result
+
+    to_cache = {}
+    for txid, raw in zip(needed, responses):
+        result[txid] = raw
+        if raw is None:
+            continue
+        is_confirmed = bool(
+            raw.get("blockhash") or raw.get("blocktime") or raw.get("confirmations", 0) > 0
+        )
+        if is_confirmed:
+            to_cache[txid] = raw
+
+    if to_cache:
+        with _tx_cache_lock:
+            for txid, raw in to_cache.items():
+                if txid not in _tx_cache:
+                    if len(_tx_cache) >= MAX_TX_CACHE_SIZE:
+                        for key in list(_tx_cache.keys())[:MAX_TX_CACHE_SIZE // 2]:
+                            del _tx_cache[key]
+                        log.info("TX cache evicted %d entries", MAX_TX_CACHE_SIZE // 2)
+                    _tx_cache[txid] = raw
+
+    return result
+
+
 def _vout_address(vout_entry: dict) -> str | None:
     """Extract address string from a verbose vout entry (handles old/new ElectrumX)."""
     spk = vout_entry.get("scriptPubKey", {})
@@ -477,16 +531,9 @@ def get_history(address: str):
         return jsonify(utils.ok([]))
 
     try:
-        # Step 1 — fetch main TXs in parallel
-        def _fetch_main(item):
-            try:
-                return (item, _get_tx_verbose(item["tx_hash"]))
-            except Exception as e:
-                log.warning("history: failed to fetch tx %s: %s", item["tx_hash"][:12], e)
-                return (item, None)
-
-        main_pool = gevent.pool.Pool(min(len(recent), 8))
-        main_txs  = list(main_pool.imap(_fetch_main, recent))
+        # Step 1 — fetch main TXs in one pipelined batch
+        _main_raw = _get_tx_verbose_batch([item["tx_hash"] for item in recent])
+        main_txs  = [(item, _main_raw.get(item["tx_hash"])) for item in recent]
 
         # Step 2 — collect unique prevout txids we need to resolve inputs
         prevout_needed: set[str] = set()
@@ -497,19 +544,8 @@ def get_history(address: str):
                 if "coinbase" not in vin and "txid" in vin:
                     prevout_needed.add(vin["txid"])
 
-        # Step 3 — fetch prevout TXs in parallel (mostly cache hits after first call)
-        def _fetch_prevout(ptxid):
-            try:
-                return (ptxid, _get_tx_verbose(ptxid))
-            except Exception as e:
-                log.warning("history: failed to fetch prevout %s: %s", ptxid[:12], e)
-                return (ptxid, None)
-
-        if prevout_needed:
-            p_pool      = gevent.pool.Pool(min(len(prevout_needed), 16))
-            prevout_map = dict(p_pool.imap(_fetch_prevout, prevout_needed))
-        else:
-            prevout_map = {}
+        # Step 3 — fetch prevout TXs in one pipelined batch (mostly cache hits after first call)
+        prevout_map = _get_tx_verbose_batch(list(prevout_needed)) if prevout_needed else {}
 
         # Step 4 — annotate each TX
         results = []

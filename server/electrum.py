@@ -88,6 +88,53 @@ class ElectrumClient:
                 raise ConnectionError("Server closed the connection")
             self._buf += chunk
 
+    def _rpc_batch(self, requests):
+        """
+        Pipeline N requests over one connection in a single write.
+
+        requests : list of (method, params_list)
+        returns  : list of results aligned to input order.
+                   Per-item ElectrumX errors (e.g. txid not found) produce None.
+                   Transport errors raise and are handled by call_batch.
+        """
+        if not requests:
+            return []
+
+        ids   = []
+        lines = []
+        for method, params in requests:
+            self._req_id += 1
+            req_id = self._req_id
+            ids.append(req_id)
+            lines.append(json.dumps({"id": req_id, "method": method, "params": params}))
+
+        self._sock.sendall(("\n".join(lines) + "\n").encode())
+
+        pending = set(ids)
+        results = {}
+
+        while pending:
+            while b"\n" in self._buf:
+                line, self._buf = self._buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                resp = json.loads(line)
+                rid  = resp.get("id")
+                if rid not in pending:
+                    continue  # server-push or unrelated response
+                pending.discard(rid)
+                # Per-item ElectrumX errors (unknown txid, etc.) → None so
+                # callers can continue processing the rest of the batch.
+                results[rid] = None if resp.get("error") else resp["result"]
+            if pending:
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("Server closed the connection")
+                self._buf += chunk
+
+        return [results[req_id] for req_id in ids]
+
     def call(self, method, *params):
         with self._lock:
             try:
@@ -98,6 +145,23 @@ class ElectrumClient:
                 log.warning("Socket error on %s (%s) — reconnecting", method, exc)
                 self._connect()
                 return self._rpc(method, list(params))
+
+    def call_batch(self, requests):
+        """
+        Send multiple RPC calls in one round-trip (pipelining).
+
+        requests : list of (method, params_list)
+        returns  : list of results aligned to input order (None on per-item error).
+        """
+        with self._lock:
+            try:
+                if not self._sock:
+                    self._connect()
+                return self._rpc_batch(requests)
+            except (OSError, ConnectionError, ssl.SSLError) as exc:
+                log.warning("Socket error on batch (%s) — reconnecting", exc)
+                self._connect()
+                return self._rpc_batch(requests)
 
     def close(self):
         with self._lock:
@@ -126,6 +190,19 @@ class ElectrumPool:
         client = self._queue.get()
         try:
             return client.call(method, *params)
+        finally:
+            self._queue.put(client)
+
+    def call_batch(self, requests):
+        """
+        Acquire one connection and send all requests as a pipelined batch.
+
+        requests : list of (method, params_list)
+        returns  : list of results aligned to input order.
+        """
+        client = self._queue.get()
+        try:
+            return client.call_batch(requests)
         finally:
             self._queue.put(client)
 
