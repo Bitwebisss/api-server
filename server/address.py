@@ -1,6 +1,6 @@
 import hashlib
 
-from segwit_addr import bech32_decode, convertbits, Encoding
+from .segwit_addr import bech32_decode, convertbits, Encoding
 import base58 as _b58
 
 __all__ = ["address_to_scriptpubkey", "address_to_scripthash"]
