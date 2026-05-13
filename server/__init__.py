@@ -1,4 +1,3 @@
-# server/__init__.py
 import logging
 from flask import Flask, render_template
 from flask_cors import CORS
@@ -15,8 +14,6 @@ app.config["SECRET_KEY"] = config.SECRET
 app.url_map.strict_slashes = False
 CORS(app)
 
-# async_mode=gevent — requires gevent.monkey.patch_all() before any imports (done in app.py)
-# cors_allowed_origins="*" — HTTP CORS already handled by flask-cors above
 socketio = SocketIO(app, async_mode="gevent", cors_allowed_origins="*")
 
 
@@ -25,5 +22,5 @@ def index():
     return render_template("index.html")
 
 
-from server import rest   # noqa: E402 – must come after app + socketio are created
+from server import rest  # noqa: E402
 rest.init(app)

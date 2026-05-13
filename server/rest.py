@@ -1,4 +1,3 @@
-# server/rest.py
 """
 REST API blueprint.
 
@@ -22,18 +21,17 @@ import time
 
 from flask import Blueprint, jsonify, request
 from flask_cors import cross_origin
-from flask_socketio import join_room
+from flask_socketio import join_room, leave_room
 
 from server.electrum import ElectrumPool, ElectrumSubscriber
 from server.address  import address_to_scripthash, address_to_scriptpubkey
-from server           import utils, socketio
+from server          import utils, socketio
 import config
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# ElectrumX connection pool (POOL_SIZE parallel connections for HTTP requests)
-# ---------------------------------------------------------------------------
+# Module-level state — intentionally private (_) to prevent accidental import
+
 _pool = ElectrumPool(
     host       = config.ELECTRUM_HOST,
     port       = config.ELECTRUM_PORT,
@@ -42,10 +40,6 @@ _pool = ElectrumPool(
     size       = config.ELECTRUM_POOL_SIZE,
 )
 
-# ---------------------------------------------------------------------------
-# ElectrumX subscriber (dedicated connection for push notifications)
-# Starts once when rest.init() is called.
-# ---------------------------------------------------------------------------
 _subscriber = ElectrumSubscriber(
     host       = config.ELECTRUM_HOST,
     port       = config.ELECTRUM_PORT,
@@ -55,69 +49,85 @@ _subscriber = ElectrumSubscriber(
 
 bp = Blueprint("api", __name__)
 
-# ---------------------------------------------------------------------------
-# In-memory coinbase cache  {txid: bool}
-# Coinbase status is immutable once mined — cache forever, never invalidate.
-# Bounded to MAX_COINBASE_CACHE_SIZE entries; when full, oldest half is evicted.
-# ---------------------------------------------------------------------------
+# Coinbase cache {txid: bool} — immutable once mined, never invalidated.
+# Bounded to MAX_COINBASE_CACHE_SIZE; oldest half evicted when full (~20 MB max).
 _coinbase_cache: dict[str, bool] = {}
 _coinbase_lock  = threading.Lock()
-MAX_COINBASE_CACHE_SIZE = 100_000   # ~20 MB max
+MAX_COINBASE_CACHE_SIZE = 100_000
+
+# Tip height cache — populated by on_new_block, TTL-refreshed on cache miss.
+_tip_cache: dict = {}  # {"height": int, "expires": float}
+_tip_lock  = threading.Lock()
+_TIP_TTL   = 5.0       # seconds
+
+# Verbose TX cache — confirmed TXs are immutable, cached indefinitely.
+# Bounded to MAX_TX_CACHE_SIZE; oldest half evicted when full.
+_tx_cache: dict[str, dict] = {}
+_tx_cache_lock = threading.Lock()
+MAX_TX_CACHE_SIZE = 50_000
+
+# History cache {scripthash: raw_history_list}.
+# Eliminates the dominant source of pool exhaustion under load — without it
+# every /history request hits ElectrumX even when nothing changed.
+# Invalidated in on_scripthash_change().
+_history_cache: dict[str, list] = {}
+_history_cache_lock = threading.Lock()
+MAX_HISTORY_CACHE_SIZE = 50_000
+
+# WebSocket state
+_sid_rooms:           dict = {}  # sid -> currently subscribed scripthash
+_sid_last_sub:        dict = {}  # sid -> monotonic timestamp of last subscribe
+_scripthash_scripts:  dict = {}  # scripthash -> script hex
+_scripthash_refcount: dict = {}  # scripthash -> number of subscribed sids
+_sid_lock = threading.Lock()
+
+_SUB_MIN_INTERVAL = 1.0  # seconds between subscribe calls per connection
+
+# Validation regexes
+_RE_TXID    = re.compile(r'^[0-9a-fA-F]{64}$')
+_RE_ADDRESS = re.compile(r'^[a-zA-Z0-9]{25,90}$')
+_RE_HEX     = re.compile(r'^[0-9a-fA-F]+$')
+_BROADCAST_MAX_BYTES = 100_000
+
 
 # ---------------------------------------------------------------------------
-# Tip height cache  — /info subscribes once, then caches the result for 5 s
-# so that rapid polling doesn't accumulate server-push notifications in the
-# ElectrumX read buffer.
+# Internal helpers
 # ---------------------------------------------------------------------------
-_tip_cache: dict = {}          # {"height": int, "expires": float}
-_TIP_TTL = 5.0                 # seconds
 
-def _get_tip_height() -> int:
+def get_tip_height() -> int:
     """
     Return current chain tip height.
 
-    Reads from _tip_cache when fresh (populated by _on_new_block or a prior
-    call).  Falls back to blockchain.headers.subscribe on the pool exactly once
-    when the cache is cold (first request before any block notification).
-
-    Thread-safe: uses _tip_lock for the cache-miss path.
+    Reads from _tip_cache when fresh; falls back to blockchain.headers.subscribe
+    on cache miss. Thread-safe via double-checked locking on _tip_lock.
     """
     now = time.monotonic()
-    # Fast path — no lock needed for a read when cache is hot
     if _tip_cache.get("height") is not None and now < _tip_cache.get("expires", 0):
         return _tip_cache["height"]
 
     with _tip_lock:
-        # Re-check inside the lock (another thread may have just populated it)
         now = time.monotonic()
         if _tip_cache.get("height") is not None and now < _tip_cache.get("expires", 0):
             return _tip_cache["height"]
 
-        # blockchain.headers.subscribe returns the current tip on every call.
-        # Pool connections correctly discard any subsequent server-push
-        # notifications in ElectrumClient._rpc, so calling it here is safe.
         tip = _pool.call("blockchain.headers.subscribe")
         _tip_cache["height"]  = tip["height"]
         _tip_cache["expires"] = time.monotonic() + _TIP_TTL
         return _tip_cache["height"]
 
-# ---------------------------------------------------------------------------
-# Coinbase detection helper
-# ---------------------------------------------------------------------------
 
-def _is_coinbase(txid: str) -> bool:
+def is_coinbase_tx(txid: str) -> bool:
     """
     Return True if txid is a coinbase transaction.
     Uses in-memory cache — fetches full TX at most once per txid.
-    Double-checked locking: only one greenlet writes, others reuse result.
     """
     with _coinbase_lock:
         if txid in _coinbase_cache:
             return _coinbase_cache[txid]
 
     try:
-        raw = _pool.call("blockchain.transaction.get", txid, True)
-        vin = raw.get("vin", [])
+        raw    = _pool.call("blockchain.transaction.get", txid, True)
+        vin    = raw.get("vin", [])
         result = bool(vin and "coinbase" in vin[0])
     except Exception:
         return False
@@ -132,36 +142,11 @@ def _is_coinbase(txid: str) -> bool:
             _coinbase_cache[txid] = result
     return result
 
-# ---------------------------------------------------------------------------
-# Verbose TX cache  — confirmed TXs are immutable, cache forever.
-# Bounded to MAX_TX_CACHE_SIZE; oldest half evicted when full.
-# ---------------------------------------------------------------------------
-_tx_cache: dict[str, dict] = {}
-_tx_cache_lock = threading.Lock()
-MAX_TX_CACHE_SIZE = 50_000   # ~< 100 MB depending on tx size
 
-# ---------------------------------------------------------------------------
-# History result cache  {scripthash: raw_history_list}
-#
-# blockchain.scripthash.get_history is the most-called ElectrumX method and
-# the result only changes when a new TX arrives or confirms.  We cache it per
-# scripthash and invalidate it in _on_scripthash_change().
-#
-# This eliminates the dominant source of pool exhaustion under load: without
-# the cache every /history request hammers the pool even when nothing changed.
-# ---------------------------------------------------------------------------
-_history_cache: dict[str, list] = {}
-_history_cache_lock = threading.Lock()
-MAX_HISTORY_CACHE_SIZE = 50_000  # scripthashes; each entry is a small list
-
-
-def _get_tx_verbose(txid: str) -> dict:
-    """Fetch verbose TX from ElectrumX, serving from cache when available.
-
-    Only confirmed transactions (those with a blockhash/blocktime) are cached.
-    Unconfirmed (mempool) transactions are never stored: they can gain a
-    blocktime once mined, and caching them would cause stale timestamp=None
-    forever even after confirmation.
+def fetch_verbose_tx(txid: str) -> dict:
+    """
+    Fetch verbose TX from ElectrumX, serving from cache when available.
+    Only confirmed TXs (with blockhash/blocktime) are cached.
     """
     with _tx_cache_lock:
         if txid in _tx_cache:
@@ -169,9 +154,6 @@ def _get_tx_verbose(txid: str) -> dict:
 
     raw = _pool.call("blockchain.transaction.get", txid, True)
 
-    # Кешируем только подтверждённые TX — у них есть blockhash или blocktime.
-    # Мемпуловые TX не кешируем: после майнинга они обретают blocktime,
-    # и устаревший кеш вернул бы timestamp=None навсегда.
     is_confirmed = bool(raw.get("blockhash") or raw.get("blocktime") or raw.get("confirmations", 0) > 0)
     if is_confirmed:
         with _tx_cache_lock:
@@ -184,16 +166,15 @@ def _get_tx_verbose(txid: str) -> dict:
     return raw
 
 
-def _get_tx_verbose_batch(txids: list) -> dict:
+def fetch_verbose_tx_batch(txids: list) -> dict:
     """
     Fetch multiple verbose TXs in one pipelined batch, serving cache hits first.
 
-    Returns {txid: raw_dict | None}.  None means the fetch failed or ElectrumX
-    reported an error (unknown txid).  Confirmed TXs are written back to
-    _tx_cache exactly as _get_tx_verbose does.
+    Returns {txid: raw_dict | None}. None means the fetch failed or ElectrumX
+    reported an error. Confirmed TXs are written back to _tx_cache.
     """
-    result  = {}
-    needed  = []
+    result = {}
+    needed = []
 
     with _tx_cache_lock:
         for txid in txids:
@@ -238,9 +219,9 @@ def _get_tx_verbose_batch(txids: list) -> dict:
     return result
 
 
-def _vout_address(vout_entry: dict) -> str | None:
+def extract_vout_address(vout_entry: dict) -> str | None:
     """Extract address string from a verbose vout entry (handles old/new ElectrumX)."""
-    spk = vout_entry.get("scriptPubKey", {})
+    spk  = vout_entry.get("scriptPubKey", {})
     addr = spk.get("address")
     if addr:
         return str(addr)
@@ -250,65 +231,42 @@ def _vout_address(vout_entry: dict) -> str | None:
     return None
 
 
-def _vout_sats(vout_entry: dict) -> int:
-    """Return vout value in satoshis."""
+def vout_to_satoshis(vout_entry: dict) -> int:
     return int(round(vout_entry.get("value", 0) * 1e8))
 
 
-# ---------------------------------------------------------------------------
-# Validation helpers
-# ---------------------------------------------------------------------------
-
-# Exactly 64 lowercase or uppercase hex chars
-_RE_TXID = re.compile(r'^[0-9a-fA-F]{64}$')
-
-# bech32 addresses (web1q...) are ~62 chars; base58 are 25-34 chars.
-# Allow alphanumeric only, 25-90 chars — any deeper check is done by
-# address_to_scripthash which will raise ValueError for garbage.
-_RE_ADDRESS = re.compile(r'^[a-zA-Z0-9]{25,90}$')
-
-# Raw transaction hex: even-length hex string, max 100 KB (200 000 hex chars)
-_RE_HEX     = re.compile(r'^[0-9a-fA-F]+$')
-_BROADCAST_MAX_BYTES = 100_000   # 100 KB raw tx hex ceiling
-
-def _check_address(address: str):
+def validate_address(address: str):
     """Raise ValueError if address looks obviously wrong before hitting ElectrumX."""
     if not address or not _RE_ADDRESS.match(address):
-        raise ValueError(
-            "Invalid address format — expected alphanumeric, 25-90 characters"
-        )
+        raise ValueError("Invalid address format — expected alphanumeric, 25-90 characters")
 
-def _check_txid(txid: str):
+
+def validate_txid(txid: str):
     """Raise ValueError if txid is not exactly 64 hex chars."""
     if not txid or not _RE_TXID.match(txid):
         raise ValueError("Invalid txid — expected 64 hex characters")
 
-# ---------------------------------------------------------------------------
-# /info
-# ---------------------------------------------------------------------------
 
-_tip_lock = threading.Lock()
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @bp.route("/info", methods=["GET"])
 @cross_origin()
 def get_info():
     try:
-        height = _get_tip_height()
+        height = get_tip_height()
         return jsonify(utils.ok({"blocks": height}))
     except Exception as exc:
         log.exception("GET /info")
         return jsonify(utils.err(500, str(exc))), 500
 
 
-# ---------------------------------------------------------------------------
-# /balance/<address>
-# ---------------------------------------------------------------------------
-
 @bp.route("/balance/<string:address>", methods=["GET"])
 @cross_origin()
 def get_balance(address: str):
     try:
-        _check_address(address)
+        validate_address(address)
         scripthash = address_to_scripthash(address)
     except ValueError as exc:
         return jsonify(utils.err(400, str(exc))), 400
@@ -326,19 +284,14 @@ def get_balance(address: str):
         return jsonify(utils.err(500, str(exc))), 500
 
 
-# ---------------------------------------------------------------------------
-# /unspent/<address>
-# ---------------------------------------------------------------------------
-
 @bp.route("/unspent/<string:address>", methods=["GET"])
 @cross_origin()
 def get_unspent(address: str):
     try:
-        _check_address(address)
+        validate_address(address)
     except ValueError as exc:
         return jsonify(utils.err(400, str(exc))), 400
 
-    # Validate query params explicitly — ignore anything unexpected
     try:
         raw_amount = request.args.get("amount", "0")
         if not re.match(r'^\d{1,15}$', raw_amount):
@@ -361,36 +314,30 @@ def get_unspent(address: str):
         log.exception("GET /unspent/%s", address)
         return jsonify(utils.err(500, str(exc))), 500
 
-    # Сначала фильтруем — не дёргаем coinbase для отброшенных UTXO
+    # Filter before enriching — don't call is_coinbase_tx for discarded UTXOs
     filtered = [
         u for u in utxos
         if not (confirmed_only and u["height"] == 0)
         and not (min_value > 0 and u["value"] < min_value)
     ]
 
-    def _enrich(u):
+    def enrich_utxo(u):
         return {
             "txid":     u["tx_hash"],
             "index":    u["tx_pos"],
             "value":    u["value"],
             "height":   u["height"],
             "script":   script_hex,
-            "coinbase": _is_coinbase(u["tx_hash"]),
+            "coinbase": is_coinbase_tx(u["tx_hash"]),
         }
 
-    # Все coinbase-запросы летят параллельно (кэш — большинство хитов)
-    # size ограничен 20 — не создаём лишних гринлетов при малом числе UTXO
     if filtered:
-        gpool = gevent.pool.Pool(min(len(filtered), 20))
-        result = list(gpool.imap(_enrich, filtered))
+        gpool  = gevent.pool.Pool(min(len(filtered), 20))
+        result = list(gpool.imap(enrich_utxo, filtered))
     else:
         result = []
     return jsonify(utils.ok(result))
 
-
-# ---------------------------------------------------------------------------
-# /fee
-# ---------------------------------------------------------------------------
 
 @bp.route("/fee", methods=["GET"])
 @cross_origin()
@@ -398,21 +345,15 @@ def get_fee():
     return jsonify(utils.ok({"feerate": config.FIXED_FEE_SATOSHIS}))
 
 
-# ---------------------------------------------------------------------------
-# /tx/<txid>
-# ---------------------------------------------------------------------------
-
 @bp.route("/tx/<string:txid>", methods=["GET"])
 @cross_origin()
 def get_tx(txid: str):
     """
     Return verbose transaction from ElectrumX.
-
-    vout items get an extra field  value_sat (int satoshis) in addition to
-    the native float  value  field, so clients avoid float math.
+    vout items get an extra field value_sat (int satoshis) to avoid float math.
     """
     try:
-        _check_txid(txid)
+        validate_txid(txid)
     except ValueError as exc:
         return jsonify(utils.err(400, str(exc))), 400
 
@@ -430,42 +371,30 @@ def get_tx(txid: str):
     return jsonify(utils.ok(raw))
 
 
-# ---------------------------------------------------------------------------
-# /history/<address>
-# ---------------------------------------------------------------------------
-
 @bp.route("/history/<string:address>", methods=["GET"])
 @cross_origin()
 def get_history(address: str):
     """
-    Return last N transactions for *address*, annotated with direction and amount.
+    Return last N transactions for address, annotated with direction and amount.
 
     Algorithm (same as Electrum wallet — works for Legacy, SegWit, Taproot,
     multi-send, consolidation, send-to-self):
 
       1. blockchain.scripthash.get_history  → list of {tx_hash, height}
       2. blockchain.transaction.get(txid, verbose=True) for each recent TX
-         → full vin (with prevout txid+index) and vout (with scriptPubKey.address)
-      3. For every non-coinbase vin, fetch the *previous* TX to read the address
-         and value of the output being spent. All fetches run in parallel.
+      3. For every non-coinbase vin, fetch the previous TX to read the prevout.
       4. Direction:
            mine_in  = Σ value of inputs  whose prevout address == our address
            mine_out = Σ value of outputs whose address         == our address
 
-           mine_in > 0, mine_out >= mine_in          → 'self' (consolidation or
-                                                        batched incoming+change)
+           mine_in > 0, mine_out >= mine_in     → 'self'
            mine_in > 0, has external out,
-                        mine_out < mine_in            → 'out'  (net = mine_in − mine_out)
-           mine_in == 0, mine_out > 0                → 'in'
-           otherwise                                 → 'unknown'
-
-    Confirmed TXs are cached in _tx_cache; repeated calls are cheap.
+                        mine_out < mine_in       → 'out'  (net = mine_in − mine_out)
+           mine_in == 0, mine_out > 0            → 'in'
+           otherwise                             → 'unknown'
 
     Query params:
-      limit  — max entries returned (default 10, max 50)
-
-    Response: {"result": [...], "error": null}
-    Item fields: txid, height, timestamp, direction, amount, mine_in, mine_out
+      limit — max entries returned (default 10, max 50)
     """
     try:
         limit = min(int(request.args.get("limit", 10)), 50)
@@ -473,18 +402,17 @@ def get_history(address: str):
         limit = 10
 
     try:
-        _check_address(address)
+        validate_address(address)
         scripthash = address_to_scripthash(address)
     except ValueError as exc:
         return jsonify(utils.err(400, str(exc))), 400
 
     try:
-        # Serve from cache when available; invalidated by _on_scripthash_change().
         with _history_cache_lock:
-            _raw = _history_cache.get(scripthash)
+            raw_history = _history_cache.get(scripthash)
 
-        if _raw is None:
-            _raw = _pool.call("blockchain.scripthash.get_history", scripthash)
+        if raw_history is None:
+            raw_history = _pool.call("blockchain.scripthash.get_history", scripthash)
             with _history_cache_lock:
                 if scripthash not in _history_cache:
                     if len(_history_cache) >= MAX_HISTORY_CACHE_SIZE:
@@ -492,50 +420,42 @@ def get_history(address: str):
                         for k in list(_history_cache.keys())[:evict]:
                             del _history_cache[k]
                         log.info("History cache evicted %d entries", evict)
-                    _history_cache[scripthash] = _raw
+                    _history_cache[scripthash] = raw_history
 
         history = []
         seen: set[str] = set()
-        for _h in _raw:
-            _height = _h["height"]
-            if _height < -1:
-                # height < -1 is not defined by the ElectrumX protocol — skip.
-                continue
-            if _height == -1:
-                # height=-1: mempool TX whose inputs are also unconfirmed.
-                # Normalise to 0 so the frontend shows a "pending" badge.
-                _h = dict(_h, height=0)
-            # Deduplicate by txid.  During a reorg ElectrumX can return the
-            # same txid twice: once confirmed (height=N) and again as mempool
-            # (height=0).  Keep the first occurrence (confirmed takes priority).
-            if _h["tx_hash"] not in seen:
-                seen.add(_h["tx_hash"])
-                history.append(_h)
+        for h in raw_history:
+            height = h["height"]
+            if height < -1:
+                continue          # undefined by ElectrumX protocol
+            if height == -1:
+                h = dict(h, height=0)  # mempool TX with unconfirmed inputs → normalise
+            # Deduplicate by txid — during a reorg ElectrumX can return the same
+            # txid twice. Keep the first occurrence (confirmed takes priority).
+            if h["tx_hash"] not in seen:
+                seen.add(h["tx_hash"])
+                history.append(h)
 
-        # Reorg cache invalidation: if a TX we previously cached as confirmed now
-        # appears at height=0 (reorg put it back in the mempool), its cached
-        # verbose object is stale — it still carries the old blockhash/blocktime.
-        # Evict it so _get_tx_verbose fetches a fresh copy from the node.
+        # Reorg eviction: if a TX we cached as confirmed is back at height=0,
+        # evict it so fetch_verbose_tx returns a fresh copy from the node.
         with _tx_cache_lock:
-            for _h in history:
-                if _h["height"] == 0 and _h["tx_hash"] in _tx_cache:
-                    log.debug("Evicting stale tx cache after reorg: %s", _h["tx_hash"][:16])
-                    del _tx_cache[_h["tx_hash"]]
+            for h in history:
+                if h["height"] == 0 and h["tx_hash"] in _tx_cache:
+                    log.debug("Evicting stale tx cache after reorg: %s", h["tx_hash"][:16])
+                    del _tx_cache[h["tx_hash"]]
 
     except Exception as exc:
         log.exception("GET /history/%s — history fetch", address)
         return jsonify(utils.err(500, str(exc))), 500
 
-    recent = history[-limit:][::-1]   # most-recent N, newest first
+    recent = history[-limit:][::-1]  # most-recent N, newest first
     if not recent:
         return jsonify(utils.ok([]))
 
     try:
-        # Step 1 — fetch main TXs in one pipelined batch
-        _main_raw = _get_tx_verbose_batch([item["tx_hash"] for item in recent])
-        main_txs  = [(item, _main_raw.get(item["tx_hash"])) for item in recent]
+        main_raw = fetch_verbose_tx_batch([item["tx_hash"] for item in recent])
+        main_txs = [(item, main_raw.get(item["tx_hash"])) for item in recent]
 
-        # Step 2 — collect unique prevout txids we need to resolve inputs
         prevout_needed: set[str] = set()
         for _item, tx in main_txs:
             if tx is None:
@@ -544,10 +464,8 @@ def get_history(address: str):
                 if "coinbase" not in vin and "txid" in vin:
                     prevout_needed.add(vin["txid"])
 
-        # Step 3 — fetch prevout TXs in one pipelined batch (mostly cache hits after first call)
-        prevout_map = _get_tx_verbose_batch(list(prevout_needed)) if prevout_needed else {}
+        prevout_map = fetch_verbose_tx_batch(list(prevout_needed)) if prevout_needed else {}
 
-        # Step 4 — annotate each TX
         results = []
         for item, tx in main_txs:
             if tx is None:
@@ -575,31 +493,26 @@ def get_history(address: str):
                 pvouts = ptx.get("vout", [])
                 if pvout < 0 or pvout >= len(pvouts):
                     continue
-                if _vout_address(pvouts[pvout]) == address:
-                    mine_in += _vout_sats(pvouts[pvout])
+                if extract_vout_address(pvouts[pvout]) == address:
+                    mine_in += vout_to_satoshis(pvouts[pvout])
 
             has_external_out = False
             for vout in tx.get("vout", []):
-                addr = _vout_address(vout)
+                addr = extract_vout_address(vout)
                 if addr is None:
-                    continue          # OP_RETURN / undecodable — skip
+                    continue  # OP_RETURN / undecodable
                 if addr == address:
-                    mine_out += _vout_sats(vout)
+                    mine_out += vout_to_satoshis(vout)
                 else:
                     has_external_out = True
 
             if mine_in > 0:
                 net = mine_in - mine_out
                 if not has_external_out or mine_out >= mine_in:
-                    # All outputs return to us, or we received at least as much
-                    # as we spent (batched TX where we are also a recipient).
-                    # Both cases match Electrum wallet's "self" convention.
                     direction = "self"
                     amount    = mine_out
                 else:
                     direction = "out"
-                    # net < 0 is impossible in a valid TX but guard to prevent
-                    # a negative amount reaching the response.
                     amount    = max(net, 0)
             elif mine_out > 0:
                 direction = "in"
@@ -625,20 +538,15 @@ def get_history(address: str):
         return jsonify(utils.err(500, str(exc))), 500
 
 
-# ---------------------------------------------------------------------------
-# /rawtx/<txid>
-# ---------------------------------------------------------------------------
-
 @bp.route("/rawtx/<string:txid>", methods=["GET"])
 @cross_origin()
 def get_raw_tx(txid: str):
     """
     Return raw transaction hex string.
     Required by the web wallet for signing legacy P2PKH inputs (nonWitnessUtxo).
-    Response: { "result": "<hex>", "error": null }
     """
     try:
-        _check_txid(txid)
+        validate_txid(txid)
     except ValueError as exc:
         return jsonify(utils.err(400, str(exc))), 400
 
@@ -652,14 +560,9 @@ def get_raw_tx(txid: str):
         return jsonify(utils.err(500, str(exc))), 500
 
 
-# ---------------------------------------------------------------------------
-# /broadcast
-# ---------------------------------------------------------------------------
-
 @bp.route("/broadcast", methods=["POST"])
 @cross_origin()
 def broadcast():
-    # Reject oversized bodies before reading
     if request.content_length and request.content_length > _BROADCAST_MAX_BYTES:
         return jsonify(utils.err(400, "Request body too large (max 100 KB)")), 400
 
@@ -668,11 +571,9 @@ def broadcast():
     if not raw_tx:
         return jsonify(utils.err(400, "Missing raw transaction hex")), 400
 
-    # Length guard (in case content_length header was absent or spoofed)
     if len(raw_tx) > _BROADCAST_MAX_BYTES:
         return jsonify(utils.err(400, "Transaction hex too large (max 100 KB)")), 400
 
-    # Must be pure hex and even-length (full bytes)
     if len(raw_tx) % 2 != 0 or not _RE_HEX.match(raw_tx):
         return jsonify(utils.err(400, "raw must be a valid hex string")), 400
 
@@ -689,48 +590,22 @@ def broadcast():
 
 
 # ---------------------------------------------------------------------------
-# Registration
+# WebSocket — socket.io events
 # ---------------------------------------------------------------------------
-
-def init(app):
-    app.register_blueprint(bp, url_prefix="/")
-    _start_subscriber()
-
-
-# ---------------------------------------------------------------------------
-# WebSocket — socket.io events (default namespace)
-# ---------------------------------------------------------------------------
-
-# per-sid mapping: sid -> currently subscribed scripthash
-_sid_rooms: dict = {}
-
-# per-sid rate limiting for subscribe events: sid -> monotonic timestamp of last subscribe
-_sid_last_sub: dict = {}
-_SUB_MIN_INTERVAL = 1.0   # seconds between subscribe calls per connection
-
-# scripthash -> script hex (used when pushing UTXOs to clients)
-_scripthash_scripts: dict = {}
-
-# scripthash -> number of currently subscribed sids  (O(1) membership check)
-_scripthash_refcount: dict = {}
-
-_sid_lock = threading.Lock()
-
 
 @socketio.on("connect")
-def _ws_connect():
+def ws_on_connect():
     log.debug("WS connected: %s", request.sid)
 
 
 @socketio.on("disconnect")
-def _ws_disconnect():
+def ws_on_disconnect():
     with _sid_lock:
         _sid_last_sub.pop(request.sid, None)
         old_sh = _sid_rooms.pop(request.sid, None)
         if old_sh:
             count = _scripthash_refcount.get(old_sh, 1) - 1
             if count <= 0:
-                # No subscribers left — free associated state
                 _scripthash_refcount.pop(old_sh, None)
                 _scripthash_scripts.pop(old_sh, None)
             else:
@@ -738,7 +613,7 @@ def _ws_disconnect():
 
 
 @socketio.on("subscribe")
-def _ws_subscribe(data):
+def ws_on_subscribe(data):
     if not isinstance(data, dict):
         return
 
@@ -751,7 +626,7 @@ def _ws_subscribe(data):
 
     address = str(data.get("address", "")).strip()
     try:
-        _check_address(address)
+        validate_address(address)
         scripthash = address_to_scripthash(address)
         script_hex = address_to_scriptpubkey(address).hex()
     except ValueError as exc:
@@ -763,10 +638,8 @@ def _ws_subscribe(data):
         _sid_rooms[request.sid] = scripthash
         _scripthash_scripts[scripthash] = script_hex
 
-        # Increment refcount for the new scripthash
         _scripthash_refcount[scripthash] = _scripthash_refcount.get(scripthash, 0) + 1
 
-        # Decrement refcount for the previous scripthash (if the client switched address)
         if old_room and old_room != scripthash:
             count = _scripthash_refcount.get(old_room, 1) - 1
             if count <= 0:
@@ -776,37 +649,34 @@ def _ws_subscribe(data):
                 _scripthash_refcount[old_room] = count
 
     if old_room and old_room != scripthash:
-        from flask_socketio import leave_room as _leave
-        _leave(old_room)
+        leave_room(old_room)
 
     join_room(scripthash)
     _subscriber.subscribe_scripthash(scripthash)
     socketio.emit("subscribed", {"address": address}, to=request.sid)
 
-    # Capture sid before spawn — request context is gone inside the greenlet
-    sid = request.sid
+    sid = request.sid  # capture before greenlet — request context is gone inside
 
-    def _send_initial():
+    def send_initial():
         try:
             bal       = _pool.call("blockchain.scripthash.get_balance", scripthash)
             raw_utxos = _pool.call("blockchain.scripthash.listunspent", scripthash)
-            height    = _get_tip_height()
+            height    = get_tip_height()
+            sx        = _scripthash_scripts.get(scripthash, "")
 
-            sx = _scripthash_scripts.get(scripthash, "")
-
-            def _enrich_initial(u):
+            def enrich_utxo(u):
                 return {
                     "txid":     u["tx_hash"],
                     "index":    u["tx_pos"],
                     "value":    u["value"],
                     "height":   u["height"],
-                    "coinbase": _is_coinbase(u["tx_hash"]),
+                    "coinbase": is_coinbase_tx(u["tx_hash"]),
                     "script":   sx,
                 }
 
             if raw_utxos:
-                gpool = gevent.pool.Pool(min(len(raw_utxos), 20))
-                enriched = list(gpool.imap(_enrich_initial, raw_utxos))
+                gpool    = gevent.pool.Pool(min(len(raw_utxos), 20))
+                enriched = list(gpool.imap(enrich_utxo, raw_utxos))
             else:
                 enriched = []
 
@@ -821,37 +691,31 @@ def _ws_subscribe(data):
                 "utxos":       enriched,
                 "height":      height,
             }
-            # Send only to this specific client, not the whole room
             socketio.emit("balance_changed", payload, to=sid)
         except Exception as e:
             log.warning("Initial push failed for %s: %s", scripthash[:12], e)
 
-    gevent.spawn(_send_initial)
+    gevent.spawn(send_initial)
 
 
 # ---------------------------------------------------------------------------
-# Subscriber callbacks → emit to connected clients
+# Subscriber callbacks
 # ---------------------------------------------------------------------------
 
-def _on_new_block(height: int) -> None:
-    """Called by ElectrumSubscriber when a new block arrives."""
+def on_new_block(height: int) -> None:
     _tip_cache["height"]  = height
     _tip_cache["expires"] = time.monotonic() + _TIP_TTL
     log.info("New block: height=%d — pushing to all WS clients", height)
     socketio.emit("block", {"height": height})
 
 
-def _on_scripthash_change(scripthash: str) -> None:
-    """Called when ElectrumX reports a status change on a watched scripthash."""
+def on_scripthash_change(scripthash: str) -> None:
     log.debug("Balance changed: scripthash=%s…", scripthash[:12])
 
-    # Invalidate the history cache for this scripthash so the next /history
-    # request fetches fresh data from ElectrumX instead of the stale list.
     with _history_cache_lock:
         _history_cache.pop(scripthash, None)
 
-    def _fetch_and_push():
-        # O(1) check — skip fetch if no clients are watching this scripthash
+    def fetch_and_push():
         with _sid_lock:
             anyone = _scripthash_refcount.get(scripthash, 0) > 0
         if not anyone:
@@ -860,26 +724,24 @@ def _on_scripthash_change(scripthash: str) -> None:
         try:
             bal       = _pool.call("blockchain.scripthash.get_balance", scripthash)
             raw_utxos = _pool.call("blockchain.scripthash.listunspent", scripthash)
-            # _on_new_block() always fires before _on_scripthash_change() for the
-            # same block, so the cache is already fresh here.  No need to hit the
-            # pool for the tip — just read what the subscriber already wrote.
+            # on_new_block always fires before on_scripthash_change for the same block,
+            # so the tip cache is already fresh here.
             height    = _tip_cache.get("height", 0)
+            sx        = _scripthash_scripts.get(scripthash, "")
 
-            sx = _scripthash_scripts.get(scripthash, "")
-
-            def _enrich_push(u):
+            def enrich_utxo(u):
                 return {
                     "txid":     u["tx_hash"],
                     "index":    u["tx_pos"],
                     "value":    u["value"],
                     "height":   u["height"],
-                    "coinbase": _is_coinbase(u["tx_hash"]),
+                    "coinbase": is_coinbase_tx(u["tx_hash"]),
                     "script":   sx,
                 }
 
             if raw_utxos:
-                gpool = gevent.pool.Pool(min(len(raw_utxos), 20))
-                enriched = list(gpool.imap(_enrich_push, raw_utxos))
+                gpool    = gevent.pool.Pool(min(len(raw_utxos), 20))
+                enriched = list(gpool.imap(enrich_utxo, raw_utxos))
             else:
                 enriched = []
 
@@ -897,14 +759,22 @@ def _on_scripthash_change(scripthash: str) -> None:
             socketio.emit("balance_changed", payload, to=scripthash)
 
         except Exception as e:
-            log.warning("Failed to push balance for scripthash %s: %s",
-                        scripthash[:12], e)
+            log.warning("Failed to push balance for scripthash %s: %s", scripthash[:12], e)
 
-    gevent.spawn(_fetch_and_push)
+    gevent.spawn(fetch_and_push)
 
 
-def _start_subscriber() -> None:
-    _subscriber.on_new_block         = _on_new_block
-    _subscriber.on_scripthash_change = _on_scripthash_change
+def start_subscriber() -> None:
+    _subscriber.on_new_block         = on_new_block
+    _subscriber.on_scripthash_change = on_scripthash_change
     _subscriber.start()
     log.info("ElectrumX subscriber started")
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+def init(app):
+    app.register_blueprint(bp, url_prefix="/")
+    start_subscriber()

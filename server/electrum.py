@@ -1,4 +1,3 @@
-# server/electrum.py
 """
 ElectrumX JSON-RPC client over TLS.
 
@@ -22,15 +21,9 @@ CLIENT_VERSION = "1.0"
 PROTOCOL_MIN   = "1.4"
 PROTOCOL_MAX   = "1.4"
 
-# ElectrumX closes idle connections after ~10 minutes at the protocol level,
-# but the observed server-side idle timeout is ~240 s.
-# Ping every 3 minutes (180 s) to stay safely within that window.
-PING_INTERVAL = 180  # seconds
+# ElectrumX closes idle connections after ~240 s; ping every 3 min to stay alive.
+PING_INTERVAL = 180
 
-
-# ---------------------------------------------------------------------------
-# ElectrumClient
-# ---------------------------------------------------------------------------
 
 class ElectrumClient:
     """Thread-safe ElectrumX connection. Reconnects once on socket error."""
@@ -45,14 +38,14 @@ class ElectrumClient:
         self._req_id    = 0
         self._lock      = threading.Lock()
 
-    def _ssl_context(self):
+    def make_ssl_context(self):
         ctx = ssl.create_default_context()
         if not self.verify_ssl:
             ctx.check_hostname = False
             ctx.verify_mode    = ssl.CERT_NONE
         return ctx
 
-    def _connect(self):
+    def open_connection(self):
         if self._sock:
             try:
                 self._sock.close()
@@ -63,11 +56,11 @@ class ElectrumClient:
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw.settimeout(self.timeout)
         raw.connect((self.host, self.port))
-        self._sock = self._ssl_context().wrap_socket(raw, server_hostname=self.host)
+        self._sock = self.make_ssl_context().wrap_socket(raw, server_hostname=self.host)
         log.info("Connected to %s:%s", self.host, self.port)
-        self._rpc("server.version", [f"{CLIENT_NAME} {CLIENT_VERSION}", [PROTOCOL_MIN, PROTOCOL_MAX]])
+        self.send_rpc("server.version", [f"{CLIENT_NAME} {CLIENT_VERSION}", [PROTOCOL_MIN, PROTOCOL_MAX]])
 
-    def _rpc(self, method, params):
+    def send_rpc(self, method, params):
         self._req_id += 1
         req_id = self._req_id
         self._sock.sendall((json.dumps({"id": req_id, "method": method, "params": params}) + "\n").encode())
@@ -88,14 +81,13 @@ class ElectrumClient:
                 raise ConnectionError("Server closed the connection")
             self._buf += chunk
 
-    def _rpc_batch(self, requests):
+    def send_rpc_batch(self, requests):
         """
         Pipeline N requests over one connection in a single write.
 
         requests : list of (method, params_list)
         returns  : list of results aligned to input order.
-                   Per-item ElectrumX errors (e.g. txid not found) produce None.
-                   Transport errors raise and are handled by call_batch.
+                   Per-item ElectrumX errors produce None; transport errors raise.
         """
         if not requests:
             return []
@@ -122,10 +114,8 @@ class ElectrumClient:
                 resp = json.loads(line)
                 rid  = resp.get("id")
                 if rid not in pending:
-                    continue  # server-push or unrelated response
+                    continue
                 pending.discard(rid)
-                # Per-item ElectrumX errors (unknown txid, etc.) → None so
-                # callers can continue processing the rest of the batch.
                 results[rid] = None if resp.get("error") else resp["result"]
             if pending:
                 chunk = self._sock.recv(4096)
@@ -139,12 +129,12 @@ class ElectrumClient:
         with self._lock:
             try:
                 if not self._sock:
-                    self._connect()
-                return self._rpc(method, list(params))
+                    self.open_connection()
+                return self.send_rpc(method, list(params))
             except (OSError, ConnectionError, ssl.SSLError) as exc:
                 log.warning("Socket error on %s (%s) — reconnecting", method, exc)
-                self._connect()
-                return self._rpc(method, list(params))
+                self.open_connection()
+                return self.send_rpc(method, list(params))
 
     def call_batch(self, requests):
         """
@@ -156,12 +146,12 @@ class ElectrumClient:
         with self._lock:
             try:
                 if not self._sock:
-                    self._connect()
-                return self._rpc_batch(requests)
+                    self.open_connection()
+                return self.send_rpc_batch(requests)
             except (OSError, ConnectionError, ssl.SSLError) as exc:
                 log.warning("Socket error on batch (%s) — reconnecting", exc)
-                self._connect()
-                return self._rpc_batch(requests)
+                self.open_connection()
+                return self.send_rpc_batch(requests)
 
     def close(self):
         with self._lock:
@@ -173,10 +163,6 @@ class ElectrumClient:
                 self._sock = None
             self._buf = b""
 
-
-# ---------------------------------------------------------------------------
-# ElectrumPool
-# ---------------------------------------------------------------------------
 
 class ElectrumPool:
     """Round-robin pool of ElectrumClient connections."""
@@ -214,25 +200,12 @@ class ElectrumPool:
                 pass
 
 
-# ---------------------------------------------------------------------------
-# ElectrumSubscriber
-# ---------------------------------------------------------------------------
-
 class ElectrumSubscriber:
     """
     Persistent connection for server-push notifications.
 
-    Keepalive strategy
-    ------------------
-    ElectrumX closes idle connections after ~10 minutes at the application
-    level. TCP keepalive does NOT prevent this — it only detects dead TCP
-    stacks. The real fix is an application-level ping:
-
-      - recv runs with settimeout(PING_INTERVAL)
-      - on socket.timeout  → send server.ping
-      - ElectrumX replies  {"id": N, "result": null}; _dispatch ignores it
-        (no "method" field)
-      - if send/recv raises OSError the outer _run loop reconnects as usual
+    Keepalive: recv runs with settimeout(PING_INTERVAL); on socket.timeout
+    a server.ping is sent so ElectrumX doesn't close the idle connection.
     """
 
     def __init__(self, host, port, timeout, verify_ssl):
@@ -251,13 +224,12 @@ class ElectrumSubscriber:
 
         self._running = False
 
-        # Assign before calling start()
         self.on_new_block         = None  # callable(height: int)
         self.on_scripthash_change = None  # callable(scripthash: str)
 
     def start(self):
         self._running = True
-        t = threading.Thread(target=self._run, daemon=True, name="electrum-subscriber")
+        t = threading.Thread(target=self.run_loop, daemon=True, name="electrum-subscriber")
         t.start()
 
     def subscribe_scripthash(self, scripthash):
@@ -267,23 +239,20 @@ class ElectrumSubscriber:
                 return
             self._subscribed.add(scripthash)
         if self._sock:
-            self._send("blockchain.scripthash.subscribe", [scripthash])
+            self.send_message("blockchain.scripthash.subscribe", [scripthash])
 
-    # ------------------------------------------------------------------
-    # Internal
-
-    def _run(self):
+    def run_loop(self):
         while self._running:
             try:
-                self._connect()
-                self._read_loop()
+                self.open_connection()
+                self.read_loop()
             except Exception as exc:
                 log.warning("Subscriber error: %s — reconnecting in 5 s", exc)
-                self._close()
+                self.close_connection()
                 time.sleep(5)
 
-    def _connect(self):
-        self._close()
+    def open_connection(self):
+        self.close_connection()
         ctx = ssl.create_default_context()
         if not self.verify_ssl:
             ctx.check_hostname = False
@@ -292,38 +261,32 @@ class ElectrumSubscriber:
         raw.settimeout(self.timeout)
         raw.connect((self.host, self.port))
         self._sock = ctx.wrap_socket(raw, server_hostname=self.host)
-        # PING_INTERVAL as recv timeout: _read_loop wakes up every 5 minutes
-        # to send server.ping when no notifications arrive.
         self._sock.settimeout(PING_INTERVAL)
         self._buf = b""
         log.info("Subscriber connected to %s:%s", self.host, self.port)
 
-        self._send("server.version",               [f"{CLIENT_NAME} {CLIENT_VERSION}", [PROTOCOL_MIN, PROTOCOL_MAX]])
-        self._send("blockchain.headers.subscribe",  [])
+        self.send_message("server.version",              [f"{CLIENT_NAME} {CLIENT_VERSION}", [PROTOCOL_MIN, PROTOCOL_MAX]])
+        self.send_message("blockchain.headers.subscribe", [])
 
         with self._sub_lock:
             hashes = list(self._subscribed)
         for sh in hashes:
-            self._send("blockchain.scripthash.subscribe", [sh])
+            self.send_message("blockchain.scripthash.subscribe", [sh])
 
-    def _send(self, method, params):
+    def send_message(self, method, params):
         with self._send_lock:
             self._req_id += 1
             payload = json.dumps({"id": self._req_id, "method": method, "params": params}) + "\n"
             if self._sock:
                 self._sock.sendall(payload.encode())
 
-    def _read_loop(self):
+    def read_loop(self):
         while True:
             try:
                 chunk = self._sock.recv(4096)
             except socket.timeout:
-                # No data for PING_INTERVAL seconds — keep the ElectrumX
-                # session alive with an application-level ping.
                 log.debug("Subscriber idle — sending server.ping")
-                self._send("server.ping", [])
-                # Response {"id": N, "result": null} arrives on next recv
-                # and is silently dropped by _dispatch (no "method" field).
+                self.send_message("server.ping", [])
                 continue
 
             if not chunk:
@@ -336,16 +299,14 @@ class ElectrumSubscriber:
                 if not line:
                     continue
                 try:
-                    self._dispatch(json.loads(line))
+                    self.dispatch_message(json.loads(line))
                 except Exception:
                     pass
 
-    def _dispatch(self, msg):
+    def dispatch_message(self, msg):
         method = msg.get("method")
         if not method:
-            # Response to our own request (server.version / server.ping /
-            # blockchain.*.subscribe) — ignore silently.
-            return
+            return  # response to our own request (server.version / server.ping / subscribe)
 
         params = msg.get("params") or []
 
@@ -365,7 +326,7 @@ class ElectrumSubscriber:
                 except Exception:
                     pass
 
-    def _close(self):
+    def close_connection(self):
         if self._sock:
             try:
                 self._sock.close()
