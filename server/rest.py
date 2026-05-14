@@ -232,7 +232,17 @@ def extract_vout_address(vout_entry: dict) -> str | None:
 
 
 def vout_to_satoshis(vout_entry: dict) -> int:
-    return int(round(vout_entry.get("value", 0) * 1e8))
+    """Convert a vout value (float BTC from ElectrumX verbose TX) to satoshis.
+    Uses string parsing to avoid float64 precision loss at large amounts (>33M BTE).
+    Falls back to round() for edge cases like scientific notation (e.g. 1e-08).
+    """
+    raw = vout_entry.get("value", 0)
+    val = str(raw)
+    if '.' in val and 'e' not in val.lower():
+        ip, fp = val.split('.', 1)
+        fp = fp[:8].ljust(8, '0')
+        return int(ip) * 100_000_000 + int(fp)
+    return int(round(raw * 1e8))
 
 
 def validate_address(address: str):

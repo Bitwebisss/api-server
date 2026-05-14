@@ -6,3 +6,4 @@ gevent-websocket
 bech32
 base58
 gunicorn
+python-dotenv
